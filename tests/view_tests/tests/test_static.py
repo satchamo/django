@@ -8,7 +8,7 @@ from django.conf.urls.static import static
 from django.http import HttpResponseNotModified
 from django.test import SimpleTestCase, override_settings
 from django.utils.http import http_date
-from django.views.static import was_modified_since
+from django.views.static import was_modified_since, RangedFileReader
 
 from .. import urls
 from ..urls import media_dir
@@ -95,6 +95,51 @@ class StaticTests(SimpleTestCase):
         response = self.client.get('/%s/non_existing_resource' % self.prefix)
         self.assertEqual(404, response.status_code)
 
+    def test_accept_ranges(self):
+        response = self.client.get('/%s/%s' % (self.prefix, "file.txt"))
+        self.assertEqual(response['Accept-Ranges'], "bytes")
+
+    def test_syntactically_invalid_ranges(self):
+        """
+        Test that a syntactically invalid byte range header is ignored and the
+        response gives back the whole resource as per RFC 2616, section 14.35.1
+        """
+        content = open(path.join(media_dir, "file.txt")).read()
+        invalid = ["megabytes=1-2", "bytes=", "bytes=3-2", "bytes=--5", "units", "bytes=-,"]
+        for range_ in invalid:
+            response = self.client.get('/%s/%s' % (self.prefix, "file.txt"), HTTP_RANGE=range_)
+            self.assertEqual(content, b''.join(response))
+
+    def test_unsatisfiable_range(self):
+        """Test that an unsatisfiable range results in a 416 HTTP status code"""
+        content = open(path.join(media_dir, "file.txt")).read()
+        # since byte ranges are *inclusive*, 0 to len(content) would be unsatisfiable
+        response = self.client.get('/%s/%s' % (self.prefix, "file.txt"), HTTP_RANGE="bytes=0-%d" % len(content))
+        self.assertEqual(response.status_code, 416)
+
+    def test_ranges(self):
+        # set the block size to something small so we do multiple iterations in
+        # the RangedFileReader class
+        original_block_size = RangedFileReader.block_size
+        RangedFileReader.block_size = 3
+
+        content = open(path.join(media_dir, "file.txt")).read()
+        # specify the range header, the expected response content, and the
+        # values of the content-range header byte positions
+        ranges = {
+            "bytes=0-10": (content[0:11], (0, 10)),
+            "bytes=9-9": (content[9:10], (9, 9)),
+            "bytes=-5": (content[len(content)-5:], (len(content)-5, len(content)-1)),
+            "bytes=3-": (content[3:], (3, len(content)-1)),
+            "bytes=-%d" % (len(content) + 1): (content, (0, len(content)-1)),
+        }
+        for range_, (expected_result, byte_positions) in ranges.items():
+            response = self.client.get('/%s/%s' % (self.prefix, "file.txt"), HTTP_RANGE=range_)
+            self.assertEqual(expected_result, b''.join(response))
+            self.assertEqual(int(response['Content-Length']), len(expected_result))
+            self.assertEqual(response['Content-Range'], "bytes %d-%d/%d" % (byte_positions + (len(content),)))
+
+        RangedFileReader.block_size = original_block_size
 
 class StaticHelperTest(StaticTests):
     """
